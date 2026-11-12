@@ -1,9 +1,36 @@
 #include "workwindow.hpp"
 
 #include "helper.hpp"
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
+
+namespace {
+class CaptureDpiContext {
+ public:
+  CaptureDpiContext()
+      : previous_(SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+    if (!previous_) {
+      previous_ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+    }
+  }
+  ~CaptureDpiContext() {
+    if (previous_) SetThreadDpiAwarenessContext(previous_);
+  }
+
+ private:
+  DPI_AWARENESS_CONTEXT previous_;
+};
+}
 
 Napi::Value Workwindow::capture(const Napi::CallbackInfo &info) {
+  const CaptureDpiContext dpiContext;
   Napi::Env env = info.Env();
+  WINDOWINFO bounds = {};
+  bounds.cbSize = sizeof(bounds);
+  if (hWnd && !GetWindowInfo(hWnd, &bounds)) {
+    Napi::Error::New(env, "GetWindowInfo failed").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
 
   RECT rect = {0, 0, 0, 0};
 
@@ -41,11 +68,8 @@ Napi::Value Workwindow::capture(const Napi::CallbackInfo &info) {
     }
 
     if (hWnd != NULL) {
-      GetClientRect(hWnd, &rect);
-
-      width = rect.right - rect.left;
-
-      height = rect.bottom - rect.top;
+      width = bounds.rcClient.right - bounds.rcClient.left;
+      height = bounds.rcClient.bottom - bounds.rcClient.top;
     } else {
       width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
 
@@ -53,28 +77,57 @@ Napi::Value Workwindow::capture(const Napi::CallbackInfo &info) {
     }
   }
 
-  HDC context = GetDC(hWnd);
-
-  MAKEBITMAPINFO bi(height, width);
-
-  uint8_t *pixels;
-
-  HBITMAP section = CreateDIBSection(context, &bi, DIB_RGB_COLORS, (void **)&pixels, 0, 0);
-
-  if (pixels == nullptr) {
+  if (width <= 0 || height <= 0) {
+    Napi::RangeError::New(env, "Invalid capture dimensions").ThrowAsJavaScriptException();
     return env.Undefined();
   }
-
-  HDC memDC = CreateCompatibleDC(context);
-
-  DeleteObject(SelectObject(memDC, section));
-
-  BitBlt(memDC, 0, 0, width, height, context, rect.left, rect.top, SRCCOPY);
-
-  DeleteDC(memDC);
-
-  ReleaseDC(hWnd, context);
-
+  HDC context = hWnd ? GetWindowDC(hWnd) : GetDC(NULL);
+  HDC output = context ? CreateCompatibleDC(context) : NULL;
+  MAKEBITMAPINFO bi(height, width);
+  uint8_t *pixels = nullptr;
+  HBITMAP section = output ? CreateDIBSection(context, &bi, DIB_RGB_COLORS,
+                                             (void **)&pixels, NULL, 0) : NULL;
+  HGDIOBJ previous = section && pixels ? SelectObject(output, section) : NULL;
+  BOOL copied = FALSE;
+  if (previous && previous != HGDI_ERROR) {
+    if (hWnd) {
+      const RECT &outer = bounds.rcWindow;
+      const int fullWidth = outer.right - outer.left;
+      const int fullHeight = outer.bottom - outer.top;
+      HDC memory = CreateCompatibleDC(context);
+      HBITMAP bitmap = memory ? CreateCompatibleBitmap(context, fullWidth, fullHeight) : NULL;
+      HGDIOBJ original = bitmap ? SelectObject(memory, bitmap) : NULL;
+      if (original && original != HGDI_ERROR) {
+        // XCap renders the entire window before cropping to client coordinates.
+        BOOL rendered = PrintWindow(hWnd, memory, 2);
+        BOOL composition = FALSE;
+        if (!rendered && SUCCEEDED(DwmIsCompositionEnabled(&composition)) && composition) {
+          rendered = PrintWindow(hWnd, memory, 0);
+        }
+        if (!rendered) rendered = PrintWindow(hWnd, memory, 4);
+        if (!rendered) rendered = BitBlt(memory, 0, 0, fullWidth, fullHeight, context, 0, 0, SRCCOPY);
+        if (rendered) {
+          copied = BitBlt(output, 0, 0, width, height, memory,
+                          bounds.rcClient.left - outer.left + rect.left,
+                          bounds.rcClient.top - outer.top + rect.top, SRCCOPY);
+        }
+        SelectObject(memory, original);
+      }
+      if (bitmap) DeleteObject(bitmap);
+      if (memory) DeleteDC(memory);
+    } else {
+      copied = BitBlt(output, 0, 0, width, height, context, rect.left, rect.top, SRCCOPY);
+    }
+    GdiFlush();
+    SelectObject(output, previous);
+  }
+  if (output) DeleteDC(output);
+  if (context) ReleaseDC(hWnd, context);
+  if (!copied) {
+    if (section) DeleteObject(section);
+    Napi::Error::New(env, "Unable to capture window pixels").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   Napi::Object img = Napi::Object::New(env);
 
   size_t size = height * width * 4;
